@@ -10,6 +10,7 @@ import com.orientechnologies.orient.core.id.ORecordId;
 import com.orientechnologies.orient.core.storage.cache.OCacheEntry;
 import com.orientechnologies.orient.core.storage.impl.local.paginated.base.ODurablePage;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.*;
 
 public final class Bucket extends ODurablePage {
@@ -23,8 +24,9 @@ public final class Bucket extends ODurablePage {
 
   private static final int NEXT_FREE_LIST_PAGE_OFFSET = NEXT_FREE_POSITION;
 
-  private static final int POSITIONS_ARRAY_OFFSET =
-      RIGHT_SIBLING_OFFSET + OLongSerializer.LONG_SIZE;
+  private static final int KEY_PREFIX_OFFSET = RIGHT_SIBLING_OFFSET + OLongSerializer.LONG_SIZE;
+
+  private static final int POSITIONS_ARRAY_OFFSET = KEY_PREFIX_OFFSET + OIntegerSerializer.INT_SIZE;
 
   public Bucket(OCacheEntry cacheEntry) {
     super(cacheEntry);
@@ -38,6 +40,7 @@ public final class Bucket extends ODurablePage {
 
     final boolean isLeaf = isLeaf();
     if (isLeaf) {
+      setIntValue(KEY_PREFIX_OFFSET, -1);
       setByteValue(IS_LEAF_OFFSET, (byte) 0);
     } else {
       setByteValue(IS_LEAF_OFFSET, (byte) 1);
@@ -51,6 +54,7 @@ public final class Bucket extends ODurablePage {
     setByteValue(IS_LEAF_OFFSET, (byte) (isLeaf ? 1 : 0));
     setLongValue(LEFT_SIBLING_OFFSET, -1);
     setLongValue(RIGHT_SIBLING_OFFSET, -1);
+    setIntValue(KEY_PREFIX_OFFSET, -1);
   }
 
   public boolean isEmpty() {
@@ -66,7 +70,8 @@ public final class Bucket extends ODurablePage {
   }
 
   public int find(final byte[] key, int offset, int length) {
-    final ByteBuffer bufferKey = ByteBuffer.wrap(key, offset, length);
+    final ByteBuffer bufferKey =
+        ByteBuffer.wrap(key, offset, length).order(ByteOrder.nativeOrder());
 
     int low = 0;
     int high = size() - 1;
@@ -74,7 +79,9 @@ public final class Bucket extends ODurablePage {
     while (low <= high) {
       final int mid = (low + high) >>> 1;
       final ByteBuffer midVal = getKeyBuffer(mid);
-      final int cmp = midVal.compareTo(bufferKey);
+
+      bufferKey.position(offset);
+      final int cmp = compareUnsigned(midVal, bufferKey);
 
       if (cmp < 0) {
         low = mid + 1;
@@ -110,6 +117,40 @@ public final class Bucket extends ODurablePage {
     return getBinaryValueBuffer(entryPosition + OShortSerializer.SHORT_SIZE, keySize);
   }
 
+  private static int compareUnsigned(final ByteBuffer bufferOne, final ByteBuffer bufferTwo) {
+    final int longSize = 8;
+    final int commonLen = Math.min(bufferOne.remaining(), bufferTwo.remaining());
+    final int WORDS = commonLen / longSize;
+
+    for (int i = 0; i < WORDS; i++) {
+      final long wordOne = bufferOne.getLong();
+      final long wordTwo = bufferTwo.getLong();
+
+      if (wordOne != wordTwo) {
+        if (ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN) {
+          return Long.compareUnsigned(Long.reverseBytes(wordOne), Long.reverseBytes(wordTwo));
+        }
+
+        return Long.compareUnsigned(wordOne, wordTwo);
+      }
+    }
+
+    for (int i = WORDS * longSize; i < commonLen; i++) {
+      int diff = compareUnsignedByte(bufferOne.get(), bufferTwo.get());
+      if (diff != 0) {
+        return diff;
+      }
+    }
+
+    return Integer.compare(bufferOne.remaining(), bufferTwo.remaining());
+  }
+
+  private static int compareUnsignedByte(byte byteOne, byte byteTwo) {
+    final int valOne = byteOne & 0xFF;
+    final int valTwo = byteTwo & 0xFF;
+    return valOne - valTwo;
+  }
+
   public void addAll(final List<byte[]> rawEntries) {
     final int currentSize = size();
     for (int i = 0; i < rawEntries.size(); i++) {
@@ -136,7 +177,23 @@ public final class Bucket extends ODurablePage {
       rawEntries.add(getRawEntry(i));
     }
 
-    setIntValue(FREE_POINTER_OFFSET, MAX_PAGE_SIZE_BYTES);
+    final int keyPrefixOffset = getIntValue(KEY_PREFIX_OFFSET);
+    if (keyPrefixOffset >= 0) {
+      final int keyPrefixLen = getShortValue(keyPrefixOffset);
+
+      final byte[] keyPrefix =
+          getBinaryValue(keyPrefixOffset + OShortSerializer.SHORT_SIZE, keyPrefixLen);
+
+      final int newKeyPrefixOffset =
+          MAX_PAGE_SIZE_BYTES - keyPrefixLen - OShortSerializer.SHORT_SIZE;
+      setShortValue(newKeyPrefixOffset, (short) keyPrefixLen);
+      setBinaryValue(newKeyPrefixOffset + OShortSerializer.SHORT_SIZE, keyPrefix);
+
+      setIntValue(FREE_POINTER_OFFSET, newKeyPrefixOffset);
+      setIntValue(KEY_PREFIX_OFFSET, newKeyPrefixOffset);
+    } else {
+      setIntValue(FREE_POINTER_OFFSET, MAX_PAGE_SIZE_BYTES);
+    }
 
     for (int i = 0; i < newSize; i++) {
       appendRawEntry(i, rawEntries.get(i));
@@ -250,6 +307,68 @@ public final class Bucket extends ODurablePage {
     return true;
   }
 
+  public boolean setKeyPrefix(final byte[] keyPrefix) {
+    final int size = getIntValue(SIZE_OFFSET);
+    final int keyPrefixOffset = getIntValue(KEY_PREFIX_OFFSET);
+
+    final int newKeyPrefixSize = keyPrefix.length + OShortSerializer.SHORT_SIZE;
+    if (keyPrefixOffset >= 0) {
+      final int keyPrefixSize = getShortValue(keyPrefixOffset);
+
+      if (newKeyPrefixSize == keyPrefixSize) {
+        setBinaryValue(keyPrefixOffset + OShortSerializer.SHORT_SIZE, keyPrefix);
+      } else {
+        final int keyPrefixDiff = newKeyPrefixSize - keyPrefixSize;
+        final int freePointer = getIntValue(FREE_POINTER_OFFSET);
+
+        final int newFreePointer = freePointer - keyPrefixDiff;
+        if (newFreePointer < size * OIntegerSerializer.INT_SIZE + POSITIONS_ARRAY_OFFSET) {
+          return false;
+        }
+
+        setIntValue(FREE_POINTER_OFFSET, newFreePointer);
+
+        final int newKeyPrefixOffset = keyPrefixOffset - keyPrefixDiff;
+        setIntValue(KEY_PREFIX_OFFSET, newKeyPrefixOffset);
+
+        assert keyPrefixOffset >= freePointer;
+        assert newKeyPrefixOffset >= newFreePointer;
+
+        if (keyPrefixOffset > freePointer) {
+          assert newKeyPrefixOffset > newFreePointer;
+          moveData(freePointer, newFreePointer, keyPrefixOffset - freePointer);
+
+          for (int i = 0; i < size; i++) {
+            final int entryPointerOffset = POSITIONS_ARRAY_OFFSET + i * OIntegerSerializer.INT_SIZE;
+            final int entryOffset = getIntValue(entryPointerOffset);
+            if (entryOffset > keyPrefixOffset) {
+              final int newEntryOffset = entryOffset - keyPrefixDiff;
+              setIntValue(entryPointerOffset, newEntryOffset);
+            }
+          }
+        }
+
+        setShortValue(newKeyPrefixOffset, (short) keyPrefix.length);
+        setBinaryValue(newKeyPrefixOffset + OShortSerializer.SHORT_SIZE, keyPrefix);
+      }
+    } else {
+      final int freePointer = getIntValue(FREE_POINTER_OFFSET);
+      final int newFreePointer = freePointer - newKeyPrefixSize;
+
+      if (newFreePointer < size * OIntegerSerializer.INT_SIZE + POSITIONS_ARRAY_OFFSET) {
+        return false;
+      }
+
+      setIntValue(KEY_PREFIX_OFFSET, newFreePointer);
+      setIntValue(FREE_POINTER_OFFSET, newFreePointer);
+
+      setShortValue(newFreePointer, (short) keyPrefix.length);
+      setBinaryValue(newFreePointer + OShortSerializer.SHORT_SIZE, keyPrefix);
+    }
+
+    return true;
+  }
+
   public int removeLeafEntry(final int entryIndex, int keySize) {
     final int entryPosition =
         getIntValue(POSITIONS_ARRAY_OFFSET + entryIndex * OIntegerSerializer.INT_SIZE);
@@ -272,9 +391,15 @@ public final class Bucket extends ODurablePage {
     size--;
     setIntValue(SIZE_OFFSET, size);
 
+    final int keyPrefixOffset = getIntValue(KEY_PREFIX_OFFSET);
     final int freePointer = getIntValue(FREE_POINTER_OFFSET);
+
     if (size > 0 && entryPosition > freePointer) {
       moveData(freePointer, freePointer + entrySize, entryPosition - freePointer);
+
+      if (keyPrefixOffset >= 0 && keyPrefixOffset < entryPosition) {
+        setIntValue(KEY_PREFIX_OFFSET, keyPrefixOffset + entrySize);
+      }
     }
 
     setIntValue(FREE_POINTER_OFFSET, freePointer + entrySize);
@@ -388,7 +513,6 @@ public final class Bucket extends ODurablePage {
     setBinaryValue(entryPosition, value);
   }
 
-  @SuppressWarnings("BooleanMethodIsAlwaysInverted")
   public boolean updateKey(final int entryIndex, final byte[] key) {
     if (isLeaf()) {
       throw new IllegalStateException("Update key is applied to non-leaf buckets only");
@@ -419,6 +543,11 @@ public final class Bucket extends ODurablePage {
 
     if (size > 0 && entryPosition > freePointer) {
       moveData(freePointer, freePointer + entrySize, entryPosition - freePointer);
+
+      final int keyPrefixOffset = getIntValue(KEY_PREFIX_OFFSET);
+      if (keyPrefixOffset >= 0 && keyPrefixOffset < entryPosition) {
+        setIntValue(KEY_PREFIX_OFFSET, keyPrefixOffset + entrySize);
+      }
 
       int currentPositionOffset = POSITIONS_ARRAY_OFFSET;
 
@@ -489,6 +618,11 @@ public final class Bucket extends ODurablePage {
     final int freePointer = getIntValue(FREE_POINTER_OFFSET);
     if (size > 0 && entryPosition > freePointer) {
       moveData(freePointer, freePointer + entrySize, entryPosition - freePointer);
+      final int keyPrefixOffset = getIntValue(KEY_PREFIX_OFFSET);
+
+      if (keyPrefixOffset >= 0 && keyPrefixOffset < entryPosition) {
+        setIntValue(KEY_PREFIX_OFFSET, keyPrefixOffset + entrySize);
+      }
 
       int currentPositionOffset = POSITIONS_ARRAY_OFFSET;
 
